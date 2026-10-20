@@ -1,0 +1,5 @@
+numpy
+torch
+safetensors
+transformers>=5.0     # tests and collect_traces.py only
+datasets              # collect_traces.py only
