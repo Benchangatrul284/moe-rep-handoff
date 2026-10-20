@@ -227,16 +227,25 @@ python tests/test_moe_rep_meta.py
 | `mellum2-12b-a2.5b` | JetBrains/Mellum2-12B-A2.5B-Instruct（273d9c1c） | 64 | 8 | 28/28 | 0 | 還沒 |
 | `gemma4-26b-a4b-kv4` | google/gemma-4-26B-A4B-it（4d7ae498） | 128 | 8 | 30/30 | 0 | 還沒 |
 | `mixtral-8x7b` | mistralai/Mixtral-8x7B-Instruct-v0.1（eba92302） | 8 | 2 | 32/32 | 0 | 還沒 |
+| `nemotron-3-nano-kv4` | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16（bf77c317） | 128 | 6 | 23/52 | 0、2 | ✓ |
+| `qwen3.6-35b-a3b-kv4` | Qwen/Qwen3.6-35B-A3B（995ad96e） | 256 | 8 | 40/40 | 0 | ✓ |
+| `kimi-linear-48b-a3b` | moonshotai/Kimi-Linear-48B-A3B-Instruct（e1df551a） | 256 | 8 | 26/27 | 0 | ✓ |
 
 表上的模型都用 HF 上的 header（tensor 名字和 shape）跑過工具的檢查。
 
 - **OLMoE**：只能單卡，不適用。
-- **Nemotron-3-Nano、Qwen3.6-35B-A3B、Kimi-Linear**（hybrid：MoE 層之間夾著 Mamba / linear attention）：硬體已支援，我們這邊的軟體（產 bundle、golden、驗證）還在補，完成後更新這張表。
+
+hybrid 模型（MoE 層之間夾著 Mamba / linear attention）：
+
+- `num_layers` 和 meta 的列一律是 **HF 的 decoder 層**（Nemotron 52、Qwen3.6 40、Kimi-Linear 27）。不是 MoE 的層（dense、Mamba、attention）填 R = 0、identity。我們的硬體把 Qwen3.6、Kimi 的一層拆成兩個 block，由我們這邊換算。
+- Qwen3.6 的 MTP 層（`mtp.layers.0`）不給格子，工具不動它。
+- U：Nemotron 的 shared expert 是兩個 routed expert 大，可以 U = 2；Qwen3.6（shared 帶 sigmoid gate）、Kimi（shared 只有一個 expert 大）維持 TP，U = 0。
+- 2026-10-20 板測：隨機 meta，Nemotron（U = 0、2）、Qwen3.6、Kimi 兩卡 selftest 都 bit-exact、聊天通順；tok/s 還沒量。
 
 其他限制：
 
 - **HBM 由最大的 R 決定。** 每張卡每層的 expert slot 數是 `max R + (E − max R)/2 + U`，**每一層都按全部層裡最大的 R 配置**：只要有一層 R = 64，其他層也得留一樣多的空間。max R 每多 2，每張卡大約多放：Qwen3-30B、V2-Lite、Moonlight 120 MB，GLM 230 MB，Mixtral 3 GB。多出來的從 K/V pool 扣，context 變短（`check --hf` 印 GiB 數；Mixtral 8 個全複製要 735 MiB > 每個 channel 512 MiB，放不下）。
-- **U = 2** 只有 shared expert 剛好等於兩個 routed expert 大小時能用（V2-Lite、Moonlight、DeepSeek-MoE-16B）。
+- **U = 2** 只有 shared expert 剛好等於兩個 routed expert 大小時能用（V2-Lite、Moonlight、DeepSeek-MoE-16B、Nemotron-3-Nano）。
 - **GLM 的第 47 層**是 MTP 層，不在 `num_hidden_layers` 裡。工具不動它，meta 也不用給它格子。
 - **`balance` 的數字不等於板子上的 tok/s。** 實測 trace 成本降 16–18 %，tok/s 只多 3–8 %，因為每層 MoE 還有一段固定成本。最後以板子上的 tok/s 為準。
 - **trace 的精度。** 我們的 trace 用 W4 權重（板子上的量化）；用 bf16 的 HF 模型取也可以，路由只有小差異，不影響這個約定。
