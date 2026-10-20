@@ -35,6 +35,7 @@ SHARED_UNITS = (0, 2)        # spec "User decisions": U = 2 or the TP-split shar
 W4_BYTES = 4.25 / 8          # MXINT4: 4-bit elements + one 8-bit scale per 32
 ROUTER_SUFFIXES = ("gate.weight", "gate.e_score_correction_bias",      # Qwen3, DeepSeek, Mixtral, ...
                    "router.proj.weight", "router.per_expert_scale")    # Gemma-4
+TOP_K_KEYS = ("num_experts_per_tok", "num_experts_per_token", "top_k_experts")   # Kimi: _token
 EXPERT = re.compile(r"^(.*\.layers\.(\d+)\.(?:.*\.)?)experts\.(?:(\d+)\.)?(.+)$")
 SHARED = re.compile(r"^shared_experts?\.")
 
@@ -122,8 +123,9 @@ def shard_files(hf):
 
 
 def scan(hf):
-    """Names and shapes of every tensor, and the MoE structure they imply. Layers past
-    num_hidden_layers (a multi-token-prediction layer, as in GLM-4.7-Flash) stay as they are."""
+    """Names and shapes of every tensor, and the MoE structure they imply. Experts outside the
+    decoder stack stay as they are: layers past num_hidden_layers (GLM-4.7-Flash's
+    multi-token-prediction layer) and other stacks (Qwen3.6's mtp.layers)."""
     from safetensors import safe_open
     shapes = {}
     for fn in shard_files(hf):
@@ -132,10 +134,16 @@ def scan(hf):
                 shapes[n] = tuple(f.get_slice(n).get_shape())
     cfg = json.load(open(os.path.join(hf, "config.json")))
     L = cfg_get(cfg, "num_hidden_layers")
+    stacks = defaultdict(set)                       # the name before ".layers." -> its layers
+    for n in shapes:
+        m = EXPERT.match(n)
+        if m and int(m.group(2)) < L:
+            stacks[m.group(1).rsplit(".layers.", 1)[0]].add(int(m.group(2)))
+    decoder = max(stacks, key=lambda k: len(stacks[k]), default=None)
     prefix, ids, fused = {}, defaultdict(set), {}
     for n, s in shapes.items():
         m = EXPERT.match(n)
-        if not m or int(m.group(2)) >= L:
+        if not m or int(m.group(2)) >= L or m.group(1).rsplit(".layers.", 1)[0] != decoder:
             continue
         l = int(m.group(2))
         if prefix.setdefault(l, m.group(1)) != m.group(1):
@@ -150,7 +158,7 @@ def scan(hf):
 def check_ckpt(meta, ck):
     """Errors between the file and the checkpoint; also the per-expert and shared sizes."""
     E, err = meta["num_experts"], []
-    L, k = cfg_get(ck["cfg"], "num_hidden_layers"), cfg_get(ck["cfg"], "num_experts_per_tok", "top_k_experts")
+    L, k = cfg_get(ck["cfg"], "num_hidden_layers"), cfg_get(ck["cfg"], *TOP_K_KEYS)
     if L != meta["num_layers"]:
         err.append(f"num_layers {meta['num_layers']}, the checkpoint has {L}")
     if k != meta["top_k"]:
@@ -176,20 +184,24 @@ def check_ckpt(meta, ck):
                 err.append(f"{n}: {ck['shapes'][n][0]} rows, expected {E}")
     shared = {}
     for l, pre in ck["prefix"].items():
-        g = [s for n, s in ck["shapes"].items()
-             if n.startswith(pre) and SHARED.match(n[len(pre):]) and n.endswith(("gate_proj.weight", "w1.weight"))]
-        if g:
-            shared[l] = g[0][0]
+        for proj in ("gate_proj.weight", "w1.weight", "up_proj.weight"):    # up: relu^2, no gate
+            g = [s for n, s in ck["shapes"].items()
+                 if n.startswith(pre) and SHARED.match(n[len(pre):]) and n.endswith(proj)]
+            if g:
+                shared[l] = g[0][0]
+                break
     return err, dict(expert), shared
 
 
 def moe_inter(ck, l):
-    """The routed experts' intermediate size in layer l (gate projection rows)."""
-    pre = ck["prefix"][l]
-    for rest in ("gate_proj.weight", "w1.weight"):
-        s = ck["shapes"].get(f"{pre}experts.0.{rest}")
-        if s:
-            return s[0]
+    """The routed experts' intermediate size in layer l: gate projection rows (up for a
+    relu^2 expert without one; half the rows of a fused [E, 2I, d] gate_up)."""
+    pre, shapes = ck["prefix"][l], ck["shapes"]
+    for rest in ("gate_proj.weight", "w1.weight", "up_proj.weight"):
+        if f"{pre}experts.0.{rest}" in shapes:
+            return shapes[f"{pre}experts.0.{rest}"][0]
+    if f"{pre}experts.gate_up_proj" in shapes:
+        return shapes[f"{pre}experts.gate_up_proj"][1] // 2
     return None
 
 
@@ -201,19 +213,24 @@ def hw_check(meta):
         return None
     os.environ["VVD_NUM_HBM"] = "32"
     sys.path[:0] = [root, os.path.join(root, "data_prep")]
-    from common.model_configs import MODEL_CONFIGS, replicate_experts_v2, shard
+    from common.model_configs import (MODEL_CONFIGS, hf_layer_block, hf_num_layers, moe_rep_meta_blocks,
+                                      replicate_experts_v2, shard)
     import address_map
     mc = MODEL_CONFIGS.get(meta["model"])
     if mc is None:
         return [f"model {meta['model']!r} is not in common/model_configs.py"], None, None
-    moe = {l for l in range(mc.num_layers) if mc.layer_is_moe(l)}
+    # rows are HF decoder layers; a hybrid stack may hold one in two blocks (mixer, FFN)
+    L = hf_num_layers(mc)
+    moe = {l for l in range(L) if mc.layer_is_moe(hf_layer_block(mc, l))}
     err = [f"{key} {meta[key]}, our {meta['model']} has {want}"
-           for key, want in (("num_experts", mc.num_experts), ("top_k", mc.top_k), ("num_layers", mc.num_layers))
+           for key, want in (("num_experts", mc.num_experts), ("top_k", mc.top_k), ("num_layers", L))
            if meta[key] != want]
     if err:
         return err, moe, None
     try:
-        rmc = replicate_experts_v2(shard(mc, 2), meta["rep_layers"], meta.get("shared_units", 0), meta["perm"])
+        sh = shard(mc, 2)
+        reps, perm = moe_rep_meta_blocks(sh, meta["rep_layers"], meta["perm"])
+        rmc = replicate_experts_v2(sh, reps, meta.get("shared_units", 0), perm)
     except ValueError as e:
         return [str(e)], moe, None
     fixed = address_map.weight_layout(rmc, 4, rmc.num_layers).hbm0_15_end * 4 / 2**20
@@ -233,7 +250,7 @@ def cmd_init(a):
         fail(f"expert counts {sorted(E)}: not one MoE geometry")
     E, L = E.pop(), cfg_get(ck["cfg"], "num_hidden_layers")
     meta = {"schema": SCHEMA, "model": a.model, "hf_repo": a.repo or "", "num_experts": E,
-            "top_k": cfg_get(ck["cfg"], "num_experts_per_tok", "top_k_experts"), "num_layers": L,
+            "top_k": cfg_get(ck["cfg"], *TOP_K_KEYS), "num_layers": L,
             "num_ranks": 2, "shared_units": 0, "rep_layers": [0] * L,
             "perm": [list(range(E)) for _ in range(L)], "note": "identity (moe_rep_meta.py init)"}
     with open(a.out, "w") as f:
@@ -358,7 +375,7 @@ def remap(name, t, perm, inv, prefix):
     """The tensor's name and value in the reordered checkpoint, and what was done. perm[l]:
     index tensor (row j = original row perm[l][j]); inv[l][orig] = new expert number."""
     m = EXPERT.match(name)
-    if m and int(m.group(2)) in perm:
+    if m and prefix.get(int(m.group(2))) == m.group(1):
         l = int(m.group(2))
         if m.group(3) is not None:
             return f"{m.group(1)}experts.{inv[l][int(m.group(3))]}.{m.group(4)}", t, "renamed"

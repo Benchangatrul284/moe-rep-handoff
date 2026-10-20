@@ -213,6 +213,39 @@ def mtp_test(work):
     check(ok, "mtp: the layer past num_hidden_layers is unchanged, the others as without it")
 
 
+def mtp_stack_test(work):
+    """Qwen3.6's MTP module: experts under another stack (mtp.layers.0) stay as they are."""
+    src = os.path.join(work, "qwen3_moe")
+    st = load_file(os.path.join(src, "model.safetensors"))
+    st.update({n.replace("model.layers.0.", "mtp.layers.0."): t.clone() for n, t in st.items()
+               if n.startswith("model.layers.0.mlp.")})
+    mdir, mout = os.path.join(work, "mtpstack"), os.path.join(work, "mtpstack_rep")
+    os.makedirs(mdir, exist_ok=True)
+    save_file(st, os.path.join(mdir, "model.safetensors"), metadata={"format": "pt"})
+    shutil.copy(os.path.join(src, "config.json"), mdir)
+    rc, log = tool("apply", os.path.join(work, "qwen3_moe.json"), "--hf", mdir, "--out", mout)
+    check(rc == 0, "mtp stack: apply" + ("" if rc == 0 else "\n" + log))
+    if rc:
+        return
+    got = load_file(os.path.join(mout, "model.safetensors"))
+    ref = load_file(os.path.join(work, "qwen3_moe_rep", "model.safetensors"))
+    ok = all(torch.equal(got[n], st[n]) for n in st if n.startswith("mtp."))
+    ok &= all(torch.equal(got[n], t) for n, t in ref.items())
+    check(ok, "mtp stack: the experts under mtp.layers.0 unchanged, the decoder's as without them")
+
+
+def top_k_alias_test(work):
+    """Kimi names top-k num_experts_per_token."""
+    src, d = os.path.join(work, "qwen3_moe"), os.path.join(work, "alias")
+    shutil.copytree(src, d, dirs_exist_ok=True)
+    cfg = json.load(open(os.path.join(d, "config.json")))
+    cfg["num_experts_per_token"] = cfg.pop("num_experts_per_tok")
+    json.dump(cfg, open(os.path.join(d, "config.json"), "w"))
+    rc, log = tool("init", "--hf", d, "--model", "tiny", "--out", os.path.join(work, "alias.json"))
+    ok = rc == 0 and json.load(open(os.path.join(work, "alias.json")))["top_k"] == K
+    check(ok, "init reads top-k from num_experts_per_token" + ("" if rc == 0 else "\n" + log))
+
+
 def check_refusals(work):
     src = os.path.join(work, "deepseek_v3")
     good = json.load(open(os.path.join(work, "deepseek_v3.json")))
@@ -332,6 +365,8 @@ def main():
     model_tests(work)
     fused_test(work)
     mtp_test(work)
+    mtp_stack_test(work)
+    top_k_alias_test(work)
     check_refusals(work)
     repo_checks(work)
     io_refusals(work)
