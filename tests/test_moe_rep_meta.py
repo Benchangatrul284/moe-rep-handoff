@@ -12,6 +12,7 @@
    not fit HBM.
 4. balance's split rule gives the per-card counts of the hardware router (router_rule_ref.assign).
 5. The Qwen3-30B-A3B example: its meta is valid and beats the identity layout on held-out traces.
+   The DeepSeek-V2-Lite example (shared_units 2) is valid.
 
 usage: python tests/test_moe_rep_meta.py [work dir]   (torch, transformers >= 5, safetensors)
 """
@@ -33,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOL = os.path.join(ROOT, "moe_rep_meta.py")      # main() runs a copy in the work dir
 EXAMPLE = os.path.join(ROOT, "examples", "qwen3_30b_a3b")
+EXAMPLE_U2 = os.path.join(ROOT, "examples", "deepseek_v2_lite_u2", "v2lite_u2.json")
 ACCEL = os.environ.get("ACCEL_REPO")              # our repo, for the hardware check (optional)
 REPO_TOOL = ACCEL and os.path.join(ACCEL, "data_prep", "tools", "moe_rep_meta.py")
 BOARD = ACCEL and os.path.join(ACCEL, "docs", "design", "moe_rep2", "board")
@@ -355,6 +357,8 @@ def example_test():
     m = re.search(r"mean\s+([\d.]+)\s+\(R 0 identity ([\d.]+)", log)
     ok = rc == 0 and m is not None and float(m.group(1)) < float(m.group(2))
     check(ok, f"example: held-out cost below the identity layout ({log.strip().splitlines()[-1] if rc == 0 else log})")
+    rc, log = tool("check", EXAMPLE_U2)
+    check(rc == 0 and "shared units 2" in log, "example: v2lite_u2.json is valid with 2 shared units" + ("" if rc == 0 else "\n" + log))
 
 
 def main():

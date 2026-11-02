@@ -23,6 +23,7 @@ meta.json ── check / balance / apply 自己驗證 ──(只交這個檔)─
 | `tests/test_moe_rep_meta.py` | 工具的測試（tiny 隨機模型，CPU 約一分鐘） |
 | `tests/router_rule_ref.py` | 硬體分配規則的 Python 參考（從我們 repo 的 `moe_route_model.py` 抄來） |
 | `examples/qwen3_30b_a3b/` | **完整範例**：Qwen3-30B-A3B 的 trace、產生 meta 的範例方法、產出的 meta 和負載數字 |
+| `examples/deepseek_v2_lite_u2/` | shared expert 切 unit（`shared_units: 2`）的 meta 範例：DeepSeek-V2-Lite，板測 +8.2 % |
 
 安裝：`pip install -r requirements.txt`（測試和 `collect_traces.py` 要 transformers >= 5）。
 
@@ -134,6 +135,7 @@ token 選到的 k 個 expert 裡，記：
 | `perm` | 每一層一個長度 E 的排列（0 .. E−1 各出現一次）。dense 層填 identity `[0, 1, ..., E-1]` |
 | `note` | 寫清楚怎麼來的，之後才查得到 |
 
+- **shared expert**：只用 `shared_units` 表示，所有 MoE 層共用一個值。它不在 `perm` 裡，`perm`、`rep_layers` 只管 routed expert。U = 2 的完整例子在 [`examples/deepseek_v2_lite_u2/`](examples/deepseek_v2_lite_u2/README.md)。
 - **只重排、不複製**：R = 0，只改 perm。
 - **只複製、不重排**：perm 用 identity，被複製的就是原始 0..R−1 號。
 - **交出去就不要改**：要改就換新檔名。檔案的 sha256 是兩邊對帳用的。
